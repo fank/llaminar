@@ -12,6 +12,7 @@
 
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
+#include "planning/PersistentStateMemoryEstimator.h"
 #include "models/qwen4exp/Qwen4ExpPredictorProjectionGeometry.h"
 #include "models/qwen4exp/Qwen4ExpProjectionWorkspace.h"
 
@@ -391,9 +392,11 @@ bool isRoutedExpertWeight(std::string_view name)
 /** @brief Whether a tensor is prepared through the quantized NativeVNNI GEMM. */
 bool isQuantizedMatrixWeight(const TensorSizeInfo& tensor)
 {
+    // Integer tables (e.g. DeepSeek-V4 INT32 hash routing) are lookups, not projections.
     return tensor.K > 0u && tensor.elements >= tensor.K &&
            tensor.elements % tensor.K == 0u &&
-           !tensor.quant_type.empty() && !isFloatingWeight(tensor);
+           !tensor.quant_type.empty() && !isFloatingWeight(tensor) &&
+           tensor.quant_type != "I32" && tensor.quant_type != "INT32";
 }
 
 /** @brief Whether a matrix supplies the terminal vocabulary projection. */
@@ -605,7 +608,8 @@ bool workspaceOwnsTensorImpl(
     const WorkspaceMemoryGeometry& geometry)
 {
     const auto role = inferWeightRole(tensor.name);
-    if (role == WeightRole::ImmutableRowTable || isImmutableFP32WeightRole(role)) return false;
+    if (role == WeightRole::ImmutableRowTable || isImmutableFP32WeightRole(role) ||
+        isDeepSeekV4NativeOperandRole(role)) return false;
     if (tensor.layer_index < 0)
     {
         if (isEmbeddingWeight(tensor.name))
@@ -1680,6 +1684,14 @@ bool hasFullAttentionLayer(
     int first_layer,
     int last_layer)
 {
+    // Model-owned attention state (DeepSeek-V4) has no full-attention cache
+    // layer: no RoPE ABI, attention member or KV conversion consumer exists.
+    if (profile.totalLayerCount() > 0 &&
+        PersistentStateMemoryEstimator::layerStateKind(
+            profile, std::clamp(first_layer, 0, profile.totalLayerCount() - 1)) ==
+            LayerStateKind::ModelOwned)
+        return false;
+
     const bool explicit_full_attention = std::any_of(
         profile.tensors.begin(),
         profile.tensors.end(),
@@ -1768,6 +1780,11 @@ WorkspaceRequirements exactAttentionMemberRequirements(
     const ModelMemoryProfile& profile,
     const WorkspaceMemoryGeometry& geometry)
 {
+    // DeepSeek-V4 builds no AttentionComputeStage: its sparse MQA kernel owns
+    // arena-declared scratch (DeepSeekV4BufferLayout), so no FA2/split-decode
+    // workspace exists to admit.
+    if (profile.deepseek_v4)
+        return {};
     const bool has_exact_local_query_heads =
         geometry.local_query_heads > 0;
     if (geometry.device_compute_units <= 0 || geometry.batch_size <= 0 ||
@@ -1970,6 +1987,11 @@ size_t exactKVConversionWorkspaceBytes(
         throw std::runtime_error(
             "KV workspace planning requires positive batch, context, head, and TP geometry");
     }
+    // A main cache without attention layers (model-owned attention state or a
+    // recurrent-only slice) publishes no conversion scratch; see
+    // CUDARingKVCache/ROCmRingKVCache::getWorkspaceRequirements.
+    const bool main_converts = hasFullAttentionLayer(profile, geometry.first_layer,
+        geometry.last_layer < 0 ? profile.mainLayerCount() - 1 : geometry.last_layer);
 
     const int local_kv_heads =
         geometry.local_kv_heads > 0
@@ -1982,8 +2004,9 @@ size_t exactKVConversionWorkspaceBytes(
         static_cast<size_t>(local_kv_heads),
         static_cast<size_t>(profile.head_dim),
         "KV conversion local width");
-    WorkspaceRequirements requirements =
-        kv_cache_workspace::conversionRequirements({
+    WorkspaceRequirements requirements;
+    if (main_converts)
+        requirements = kv_cache_workspace::conversionRequirements({
             .configured_batch_size = geometry.batch_size,
             .configured_context_rows = geometry.max_context_rows,
             .requested_graph_rows = geometry.resident_graph_rows,

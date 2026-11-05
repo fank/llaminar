@@ -16380,6 +16380,28 @@ namespace llaminar2
                               hybrid_config_storage->countKVLayers())
                           << " GDN layers");
             }
+            else if (config.attention_state_owner == AttentionStateOwner::ModelBanks)
+            {
+                /*
+                 * The model's arena banks own every layer's attention state
+                 * (DeepSeek-V4 raw window, compressor state, packed pools).
+                 * The canonical cache is the zero-payload hybrid of
+                 * model_state layers: it still owns the sequence frontier
+                 * (device head/count rows, request reset) that position
+                 * publication consumes, but no KV slab or GDN bank. The
+                 * graph's terminal layer advances that frontier on GPU.
+                 */
+                hybrid_config_storage = std::make_unique<HybridKVCacheConfig>();
+                hybrid_config_storage->first_layer_index = std::max(0, kv_config.first_layer_index);
+                hybrid_config_storage->layer_types.assign(
+                    static_cast<size_t>(std::max(0, n_layers)), kHybridModelStateLayerType);
+                hybrid_config_storage->n_heads = config.n_heads;
+                hybrid_config_storage->local_n_heads = config.local_n_heads;
+                hybrid_config_storage->local_head_start = config.head_start;
+                kv_config.hybrid_config = hybrid_config_storage.get();
+                LOG_DEBUG("[DeviceGraphOrchestrator] Model-owned attention state: frontier-only cache with "
+                          << hybrid_config_storage->countModelStateLayers() << " model_state layers");
+            }
             kv_config.max_seq_len = max_seq_len;
             kv_config.n_kv_heads = n_kv_heads;
             kv_config.head_dim = head_dim;
@@ -55174,6 +55196,76 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::stagePromptEmbeddingRows(std::shared_ptr<const PromptEmbeddingRows> rows)
+    {
+        const auto bank = graph_builder_ ? graph_builder_->promptEmbeddingBank() : std::nullopt;
+        if (!bank)
+        {
+            if (rows)
+                LOG_ERROR("[DeviceGraphOrchestrator] This model has no prompt-embedding bank; multimodal rows are rejected");
+            return !rows;
+        }
+        if (rows &&
+            (!rows->valid() || rows->width != bank->width ||
+             rows->rowCount() > bank->rows->numel() / static_cast<std::size_t>(bank->width) ||
+             rows->position_rows.size() > bank->map->numel()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prompt-embedding rows exceed the admitted bank"
+                      << " rows=" << (rows ? rows->rowCount() : 0)
+                      << " positions=" << (rows ? rows->position_rows.size() : 0));
+            return false;
+        }
+        const std::size_t extent = std::max(prompt_embedding_map_extent_, rows ? rows->position_rows.size() : 0);
+        // The map must clear every position the previous request named, then
+        // name this request's rows; [0, extent) is rewritten as one row.
+        prompt_embedding_map_host_.assign(extent, 0);
+        if (rows)
+            std::copy(rows->position_rows.begin(), rows->position_rows.end(), prompt_embedding_map_host_.begin());
+        prompt_embedding_map_extent_ = rows ? rows->position_rows.size() : 0;
+        if (!state_.device_id.is_gpu())
+        {
+            // CPU execution is synchronous and host-owned: the previous
+            // request's forwards completed before this admission.
+            std::copy(prompt_embedding_map_host_.begin(), prompt_embedding_map_host_.end(),
+                      static_cast<std::int32_t *>(bank->map->raw_mutable_data()));
+            if (rows)
+                std::copy(rows->rows.begin(), rows->rows.end(), static_cast<float *>(bank->rows->raw_mutable_data()));
+            staged_prompt_embeddings_.reset();
+            prompt_embeddings_pending_ = false;
+            return true;
+        }
+        staged_prompt_embeddings_ = std::move(rows);
+        prompt_embeddings_pending_ = extent > 0;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::admitPromptEmbeddingRowsOnDevice(IBackend &backend, void *stream)
+    {
+        if (!prompt_embeddings_pending_)
+            return true;
+        const auto bank = graph_builder_->promptEmbeddingBank();
+        if (!bank)
+            return false;
+        // One request-admission H2D per member, on the admission stream; the
+        // readiness event published after this orders every graph reader.
+        const int ordinal = state_.device_id.gpu_ordinal();
+        if (!prompt_embedding_map_host_.empty() &&
+            !backend.hostToDeviceOnStream(bank->map->gpu_data_ptr(), prompt_embedding_map_host_.data(),
+                                          prompt_embedding_map_host_.size() * sizeof(std::int32_t), ordinal, stream))
+            return false;
+        if (staged_prompt_embeddings_ && !staged_prompt_embeddings_->rows.empty() &&
+            !backend.hostToDeviceOnStream(bank->rows->gpu_data_ptr(), staged_prompt_embeddings_->rows.data(),
+                                          staged_prompt_embeddings_->rows.size() * sizeof(float), ordinal, stream))
+            return false;
+        TransferEngine::publishDeviceWrite(bank->map, state_.device_id, stream);
+        TransferEngine::publishDeviceWrite(bank->rows, state_.device_id, stream);
+        PerfStatsCollector::addCounter("request_admission", "prompt_embedding_rows",
+            static_cast<double>(staged_prompt_embeddings_ ? staged_prompt_embeddings_->rowCount() : 0),
+            "prefill", state_.device_id.toString(), {{"owner", "model_prompt_embedding_bank"}});
+        prompt_embeddings_pending_ = false;
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::admitRequestInputsOnDevice(
         const int *tokens,
         const int *position_ids,
@@ -55399,6 +55491,11 @@ namespace llaminar2
                 "request_input_admission"))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] GPU request-input admission could not publish its complete arena transaction");
+            return false;
+        }
+        if (!decode_position && !admitPromptEmbeddingRowsOnDevice(*backend, stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] GPU request-input admission could not publish its prompt-embedding rows");
             return false;
         }
         if (!publishMTPRequestStopTokensOnDevice(
@@ -61323,6 +61420,8 @@ namespace llaminar2
             {
                 if (binding.identity.role == WeightRole::Norm ||
                     binding.identity.role == WeightRole::Bias ||
+                    isDeepSeekV4NativeOperandRole(binding.identity.role) ||
+                    binding.identity.role == WeightRole::DeepSeekV4Operator ||
                     tensor->shape().size() != 2)
                 {
                     return;

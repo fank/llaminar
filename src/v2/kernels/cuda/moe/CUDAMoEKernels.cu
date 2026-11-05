@@ -15138,7 +15138,8 @@ namespace
         }
     }
 
-    __global__ void swiglu_kernel(float *__restrict__ gate, const float *__restrict__ up, int count)
+    __global__ void swiglu_kernel(float *__restrict__ gate, const float *__restrict__ up, int count,
+                                  float swiglu_limit)
     {
         // Process four contiguous elements per thread via float4 to cut the load/store
         // instruction count 4×. count (= m*intermediate) is not guaranteed to be a
@@ -15148,7 +15149,11 @@ namespace
         if (idx < n4)
         {
             float4 g = reinterpret_cast<float4 *>(gate)[idx];
-            const float4 u = reinterpret_cast<const float4 *>(up)[idx];
+            float4 u = reinterpret_cast<const float4 *>(up)[idx];
+            llaminar2::device_swiglu_contract::clampOperands(g.x, u.x, swiglu_limit);
+            llaminar2::device_swiglu_contract::clampOperands(g.y, u.y, swiglu_limit);
+            llaminar2::device_swiglu_contract::clampOperands(g.z, u.z, swiglu_limit);
+            llaminar2::device_swiglu_contract::clampOperands(g.w, u.w, swiglu_limit);
             g.x = silu(g.x) * u.x;
             g.y = silu(g.y) * u.y;
             g.z = silu(g.z) * u.z;
@@ -15159,7 +15164,26 @@ namespace
         const int tail_base = n4 << 2;
         const int tail_idx = tail_base + idx;
         if (idx < (count & 3) && tail_idx < count)
-            gate[tail_idx] = silu(gate[tail_idx]) * up[tail_idx];
+        {
+            float g = gate[tail_idx];
+            float u = up[tail_idx];
+            llaminar2::device_swiglu_contract::clampOperands(g, u, swiglu_limit);
+            gate[tail_idx] = silu(g) * u;
+        }
+    }
+
+    /** @brief Clamp materialized DeepSeek-V4 SwiGLU operands in place (exact min/max). */
+    __global__ void swiglu_clamp_operands_kernel(
+        float *__restrict__ gate, float *__restrict__ up, int count, float swiglu_limit)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count)
+            return;
+        float g = gate[idx];
+        float u = up[idx];
+        llaminar2::device_swiglu_contract::clampOperands(g, u, swiglu_limit);
+        gate[idx] = g;
+        up[idx] = u;
     }
 
     __global__ void weighted_add_kernel(float *__restrict__ output, const float *__restrict__ input, float weight, int count)
@@ -18314,7 +18338,8 @@ namespace
         int8_t *__restrict__ A_int8,
         float *__restrict__ scales_A_blockwise,
         int num_active,
-        int K)
+        int K,
+        float swiglu_limit)
     {
         const int slot = blockIdx.x;
         if (slot >= num_active)
@@ -18337,7 +18362,7 @@ namespace
             const int col = block_idx * kBlockSize + lane;
             const float g = gate[col];
             const float value =
-                llaminar2::device_swiglu_contract::swigluValue(g, up[col]);
+                llaminar2::device_swiglu_contract::swigluValue(g, up[col], swiglu_limit);
 
             float abs_value =
 
@@ -18768,7 +18793,8 @@ namespace
         int8_t *__restrict__ swiglu_int8,
         float *__restrict__ swiglu_scales,
         int N,
-        int K)
+        int K,
+        float swiglu_limit)
     {
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
@@ -18876,7 +18902,10 @@ namespace
 
             const int slot = first_slot + m;
             // Inactive lanes (n >= N) contribute 0 to the warp absmax and skip the write.
-            const float value = active ? (silu(gate_acc[m]) * up_acc[m]) : 0.0f;
+            float gate_value = gate_acc[m];
+            float up_value = up_acc[m];
+            llaminar2::device_swiglu_contract::clampOperands(gate_value, up_value, swiglu_limit);
+            const float value = active ? (silu(gate_value) * up_value) : 0.0f;
 
             float abs_value =
 
@@ -18909,7 +18938,8 @@ namespace
         int8_t *__restrict__ A_int8,
         float *__restrict__ scales_A_blockwise,
         int total_slots,
-        int K)
+        int K,
+        float swiglu_limit)
     {
         const int block_idx = blockIdx.x;
         const int slot = logical_row_from_grid_yz();
@@ -18919,8 +18949,10 @@ namespace
             return;
 
         const size_t idx = static_cast<size_t>(slot) * K + col;
-        const float g = gate[idx];
-        const float value = silu(g) * up[idx];
+        float g = gate[idx];
+        float u = up[idx];
+        llaminar2::device_swiglu_contract::clampOperands(g, u, swiglu_limit);
+        const float value = silu(g) * u;
 
         float abs_value =
 
@@ -19702,7 +19734,8 @@ namespace
         int original_slot_base,
         int tile_route_slots,
         int N,
-        int k_partitions)
+        int k_partitions,
+        float swiglu_limit)
     {
         constexpr int kTileN = 32;
         const int lane = threadIdx.x;
@@ -19735,6 +19768,7 @@ namespace
             }
         }
 
+        llaminar2::device_swiglu_contract::clampOperands(gate_sum, up_sum, swiglu_limit);
         const float value = active ? (silu(gate_sum) * up_sum) : 0.0f;
         float abs_value =
             llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
@@ -20281,7 +20315,8 @@ namespace
         int d_model,
         int intermediate,
         int num_experts,
-        llaminar2::DeviceMoEWeightFormat format)
+        llaminar2::DeviceMoEWeightFormat format,
+        float swiglu_limit)
     {
         __shared__ float sums[kThreads];
         const int n = static_cast<int>(blockIdx.x);
@@ -20316,7 +20351,7 @@ namespace
                     const float up = up_rows[route][k];
                     const float swiglu =
                         llaminar2::device_swiglu_contract::swigluValue(
-                            gate, up);
+                            gate, up, swiglu_limit);
                     sum = fmaf(
                         swiglu,
                         load_floating_moe_weight(
@@ -20382,7 +20417,8 @@ namespace
         int intermediate,
         int d_model,
         int num_experts,
-        llaminar2::DeviceMoEWeightFormat format)
+        llaminar2::DeviceMoEWeightFormat format,
+        float swiglu_limit)
     {
         namespace warp = llaminar2::device_moe_floating_warp;
         const int lane = threadIdx.x % warp::width;
@@ -20430,7 +20466,7 @@ namespace
         if (lane == 0)
         {
             const size_t index = static_cast<size_t>(grouped_slot) * intermediate + n;
-            grouped_swiglu[index] = ready ? llaminar2::device_swiglu_contract::swigluValue(gate_sum, up_sum) : 0.0f;
+            grouped_swiglu[index] = ready ? llaminar2::device_swiglu_contract::swigluValue(gate_sum, up_sum, swiglu_limit) : 0.0f;
         }
     }
 
@@ -21071,10 +21107,203 @@ namespace
             return 8;
         return 16;
     }
+
+    /**
+     * @brief DeepSeek-V4 sqrt(softplus) selection expressed as router logits.
+     *
+     * Each row's raw logits are replaced by log(s) for the selected experts and
+     * -1e30 elsewhere, where s = sqrt(softplus(logit)) and the selection is the
+     * top-k of s + bias (ascending expert id on ties) or the token's hash row.
+     * The unchanged softmax/top-k kernels then select exactly that set with
+     * normalized weights s / sum(s); the route scale is applied afterwards.
+     */
+    template <bool Partitioned = false>
+    __global__ void scored_router_logit_transform_kernel(
+        float *__restrict__ logits, int seq_len, int num_experts, int top_k,
+        const float *__restrict__ bias, const int32_t *__restrict__ hash_table, int hash_vocab,
+        const int32_t *__restrict__ token_ids, const int *__restrict__ effective_seq_len,
+        llaminar2::DeviceRowPartition partition = {}, const float *__restrict__ image_bias = nullptr,
+        int32_t image_base = 0, int32_t image_count = 0)
+    {
+        // Partitioned (owned-row) routing keeps compact local logit rows while
+        // hash routing reads the token at the row's original coordinate.
+        const int row = blockIdx.x;
+        int token_row = row;
+        if constexpr (Partitioned)
+        {
+            const auto span = partition.resolve(seq_len, effective_seq_len);
+            if (row >= span.count)
+                return;
+            token_row = span.first + row;
+        }
+        else
+        {
+            int live = seq_len;
+            if (effective_seq_len)
+                live = min(max(*effective_seq_len, 0), seq_len);
+            if (row >= live)
+                return;
+        }
+        __shared__ float scores[kMaxExperts];
+        __shared__ float keys[kMaxExperts];
+        __shared__ int chosen[kMaxTopK];
+        __shared__ float best_value[kThreads];
+        __shared__ int best_index[kThreads];
+        float *row_logits = logits + static_cast<size_t>(row) * num_experts;
+        // DeepSeek-V4 vision: image sentinels select by s + exp_probs_b_vl on every layer.
+        bool image_row = false;
+        if (image_bias && token_ids)
+        {
+            const int32_t token = token_ids[token_row];
+            image_row = token >= image_base && token < image_base + image_count;
+        }
+        const bool hashed = hash_table && !image_row;
+        const float *select_bias = image_row ? image_bias : bias;
+        for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        {
+            const float x = row_logits[e];
+            const float s = sqrtf(x > 20.0f ? x : log1pf(expf(x)));
+            scores[e] = s;
+            keys[e] = hashed ? 0.0f : s + select_bias[e];
+        }
+        __syncthreads();
+        if (hashed)
+        {
+            if (threadIdx.x == 0)
+            {
+                const int token = token_ids[token_row];
+                if (token < 0 || token >= hash_vocab)
+                    __trap();
+                for (int k = 0; k < top_k; ++k)
+                    chosen[k] = hash_table[static_cast<size_t>(token) * top_k + k];
+            }
+        }
+        else
+        {
+            for (int k = 0; k < top_k; ++k)
+            {
+                float value = -INFINITY;
+                int index = num_experts;
+                for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+                    if (keys[e] > value || (keys[e] == value && e < index))
+                    {
+                        value = keys[e];
+                        index = e;
+                    }
+                best_value[threadIdx.x] = value;
+                best_index[threadIdx.x] = index;
+                __syncthreads();
+                for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+                {
+                    if (threadIdx.x < stride)
+                    {
+                        const float other = best_value[threadIdx.x + stride];
+                        const int other_index = best_index[threadIdx.x + stride];
+                        if (other > best_value[threadIdx.x] ||
+                            (other == best_value[threadIdx.x] && other_index < best_index[threadIdx.x]))
+                        {
+                            best_value[threadIdx.x] = other;
+                            best_index[threadIdx.x] = other_index;
+                        }
+                    }
+                    __syncthreads();
+                }
+                if (threadIdx.x == 0)
+                {
+                    chosen[k] = best_index[0];
+                    keys[best_index[0]] = -INFINITY;
+                }
+                __syncthreads();
+            }
+        }
+        __syncthreads();
+        for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        {
+            bool selected = false;
+            for (int k = 0; k < top_k; ++k)
+                selected |= chosen[k] == e;
+            row_logits[e] = selected ? logf(scores[e]) : -1.0e30f;
+        }
+    }
+
+    /** @brief Multiply published prefill route weights by the route scale. */
+    __global__ void scale_route_weights_kernel(
+        float *__restrict__ weights, int seq_len, int top_k, float scale, const int *__restrict__ effective_seq_len)
+    {
+        int live = seq_len;
+        if (effective_seq_len)
+            live = min(max(*effective_seq_len, 0), seq_len);
+        const int index = blockIdx.x * blockDim.x + threadIdx.x;
+        if (index < live * top_k)
+            weights[index] *= scale;
+    }
+
+    /** @brief Multiply this participant's compact owned-row route weights by the route scale. */
+    __global__ void scale_owned_route_weights_kernel(
+        llaminar2::MoERouterSelectedRoute *__restrict__ selected, int capacity, int top_k, float scale,
+        const int *__restrict__ live_rows, llaminar2::DeviceRowPartition partition)
+    {
+        const int count = partition.resolve(capacity, live_rows).count;
+        const int index = blockIdx.x * blockDim.x + threadIdx.x;
+        if (index < count * top_k)
+            selected[index].weight *= scale;
+    }
+
+    /** @brief Multiply the published decode runtime route weights (and legacy copy) by the route scale. */
+    __global__ void scale_runtime_route_weights_kernel(
+        DeviceMoELayerRuntimeView *__restrict__ runtime, float *legacy_weights, int top_k, float scale)
+    {
+        const int k = threadIdx.x;
+        if (k >= top_k)
+            return;
+        runtime->topk_weights[k] *= scale;
+        if (legacy_weights)
+            legacy_weights[k] *= scale;
+    }
 }
 
 extern "C"
 {
+    bool cudaMoE_scored_router_logit_transform(
+        float *logits, int seq_len, int num_experts, int top_k,
+        const float *bias, const int32_t *hash_table, int hash_vocab, const int32_t *token_ids,
+        const int *effective_seq_len, int device_idx, void *stream,
+        const float *image_bias, int32_t image_base, int32_t image_count)
+    {
+        if (!logits || !stream || seq_len <= 0 || num_experts <= 0 || num_experts > kMaxExperts ||
+            top_k <= 0 || top_k > kMaxTopK || top_k > num_experts || (hash_table ? !token_ids : !bias) ||
+            (image_bias && !token_ids))
+            return false;
+        cudaSetDevice(device_idx);
+        scored_router_logit_transform_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, seq_len, num_experts, top_k, bias, hash_table, hash_vocab, token_ids, effective_seq_len,
+            {}, image_bias, image_base, image_count);
+        return finishLaunch("cudaMoE_scored_router_logit_transform");
+    }
+
+    bool cudaMoE_scale_route_weights(float *weights, int seq_len, int top_k, float scale,
+                                     const int *effective_seq_len, int device_idx, void *stream)
+    {
+        if (!weights || !stream || seq_len <= 0 || top_k <= 0)
+            return false;
+        cudaSetDevice(device_idx);
+        const int total = seq_len * top_k;
+        scale_route_weights_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            weights, seq_len, top_k, scale, effective_seq_len);
+        return finishLaunch("cudaMoE_scale_route_weights");
+    }
+
+    bool cudaMoE_scale_runtime_route_weights(void *runtime_layer, float *legacy_weights, int top_k, float scale,
+                                             int device_idx, void *stream)
+    {
+        if (!runtime_layer || !stream || top_k <= 0 || top_k > kMaxTopK)
+            return false;
+        cudaSetDevice(device_idx);
+        scale_runtime_route_weights_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoELayerRuntimeView *>(runtime_layer), legacy_weights, top_k, scale);
+        return finishLaunch("cudaMoE_scale_runtime_route_weights");
+    }
+
     /**
      * @brief Inspect the production row-major Y/Z launch decomposition.
      *
@@ -22911,13 +23140,26 @@ extern "C"
         return finishLaunch("cudaMoE_shared_expert_column_gate_add");
     }
 
-    bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream)
+    bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream,
+        float swiglu_limit)
     {
         cudaSetDevice(device_idx);
         // One thread per float4 lane; ceil(count/4) threads cover both the vectorized
         // bulk and the (<4) scalar tail.
-        swiglu_kernel<<<blocksFor((count + 3) >> 2), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, count);
+        swiglu_kernel<<<blocksFor((count + 3) >> 2), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, count, swiglu_limit);
         return finishLaunch("cudaMoE_swiglu");
+    }
+
+    bool cudaMoE_swiglu_clamp_operands(float *gate, float *up, int count, float swiglu_limit,
+                                       int device_idx, void *stream)
+    {
+        if (!gate || !up || count <= 0 || !(swiglu_limit > 0.0f) || !stream)
+            return false;
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
+        swiglu_clamp_operands_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            gate, up, count, swiglu_limit);
+        return finishLaunch("cudaMoE_swiglu_clamp_operands");
     }
 
     bool cudaMoE_weighted_add(float *output, const float *input, float weight, int count, int device_idx, void *stream)
@@ -23966,7 +24208,8 @@ extern "C"
         int num_experts,
         llaminar2::DeviceMoEWeightFormat format,
         int device_idx,
-        void *stream)
+        void *stream,
+        float swiglu_limit)
     {
         if (!d_gate_rows || !d_up_rows || !d_down_descs || !d_expert_ids ||
             !d_route_weights || (!d_output && !d_canonical_routes) ||
@@ -23996,7 +24239,8 @@ extern "C"
                 d_model,
                 intermediate,
                 num_experts,
-                format);
+                format,
+                swiglu_limit);
         return finishLaunch(
             "cudaMoE_grouped_swiglu_down_floating_decode_table");
     }
@@ -24029,7 +24273,8 @@ extern "C"
         llaminar2::DeviceMoEWeightFormat format,
         int device_idx,
         void *stream,
-        const llaminar2::MoEPrefillProjectionExecution &execution)
+        const llaminar2::MoEPrefillProjectionExecution &execution,
+        float swiglu_limit)
     {
         if ((execution.executesGateUp() && (!d_hidden || !d_gate_descs || !d_up_descs)) ||
             (execution.executesDown() && (!d_down_descs || !d_grouped_weights ||
@@ -24067,7 +24312,8 @@ extern "C"
                     intermediate,
                     d_model,
                     num_experts,
-                    format);
+                    format,
+                    swiglu_limit);
             if (!finishLaunch("cudaMoE_grouped_floating_prefill_gate_up"))
                 return false;
         }
@@ -24312,7 +24558,8 @@ extern "C"
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
-        void *stream)
+        void *stream,
+        float swiglu_limit)
     {
         const bool valid_k_partitions =
             k_partitions ==
@@ -24332,7 +24579,8 @@ extern "C"
 
         // Step 1: quantize the per-slot SwiGLU activations (shared with serial path).
         grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
-            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, intermediate);
+            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, intermediate,
+            swiglu_limit);
         if (!finishLaunch("cudaMoE_grouped_swiglu_quantize"))
             return false;
 
@@ -24432,7 +24680,8 @@ extern "C"
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
-        void *stream)
+        void *stream,
+        float swiglu_limit)
     {
         const bool valid_k_partitions =
             k_partitions ==
@@ -24449,7 +24698,8 @@ extern "C"
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
-            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, intermediate);
+            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, intermediate,
+            swiglu_limit);
         if (!finishLaunch("cudaMoE_grouped_swiglu_runtime_quantize"))
             return false;
 
@@ -24622,7 +24872,8 @@ extern "C"
             imma_gateup_schedule,
         int device_idx,
         void *stream,
-        const llaminar2::MoEPrefillProjectionExecution &execution)
+        const llaminar2::MoEPrefillProjectionExecution &execution,
+        float swiglu_limit)
     {
         // One LUT family producer handles both factor programs; each actual
         // descriptor remains untouched and selects its own source scale.
@@ -24808,7 +25059,8 @@ extern "C"
                         imma_gateup_columns,
                         imma_gateup_schedule,
                         device_idx,
-                        stream))
+                        stream,
+                        swiglu_limit))
                 {
                     return false;
                 }
@@ -24888,7 +25140,7 @@ extern "C"
                         d_gate_partials, d_up_partials, d_original_to_grouped,
                         d_scratch_swiglu_int8, d_scratch_swiglu_scales,
                         original_slot_base, tile_route_slots, intermediate,
-                        gateup_k_partitions);
+                        gateup_k_partitions, swiglu_limit);
                     if (!finishGroupedPrefillLaunch(
                             "cudaMoE_grouped_gate_up_ordered_kpart_reduce_swiglu",
                             cuda_stream))
@@ -24926,7 +25178,7 @@ extern "C"
             <<<grid, block, 0, cuda_stream>>>(                                                         \
                 gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,          \
                 d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,             \
-                d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model)
+                d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model, swiglu_limit)
     #define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                         \
         do {                                                                                          \
             if (fuse_swiglu) {                                                                        \
@@ -25004,7 +25256,7 @@ extern "C"
                 grouped_prefill_swiglu_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
                     d_scratch_gate, d_scratch_up,
                     d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-                    total_slots, intermediate);
+                    total_slots, intermediate, swiglu_limit);
                 if (!finishGroupedPrefillLaunch("cudaMoE_grouped_swiglu_quantize_prefill", cuda_stream))
                     return false;
             }
@@ -25533,11 +25785,31 @@ namespace llaminar2::cuda
                 launch.capacity, launch.width, launch.experts, launch.live_rows, launch.partition);
             if (!finishLaunch("cudaMoE_owned_bf16_logits")) return false;
         }
+        // sqrt(softplus) score/hash routing (DeepSeek-V4) rewrites the compact
+        // logits exactly as the complete-row router does: the chosen experts
+        // keep log(s), so the normalized softmax below yields s / sum(s).
+        const auto &scored = launch.scored;
+        if (scored.enabled && rows > 0)
+        {
+            scored_router_logit_transform_kernel<true><<<rows, kThreads, 0, native_stream>>>(
+                launch.logits, launch.capacity, launch.experts, launch.top_k, scored.bias,
+                scored.hash_table, scored.hash_vocab, scored.token_ids, launch.live_rows, launch.partition,
+                scored.image_bias, scored.image_sentinel_base, scored.image_sentinel_count);
+            if (!finishLaunch("cudaMoE_owned_scored_transform")) return false;
+        }
         softmax_topk_kernel<true><<<std::max(1, rows), kThreads, 0, native_stream>>>(
             launch.logits, nullptr, nullptr, launch.capacity, launch.experts,
-            launch.top_k, launch.normalize, launch.live_rows, nullptr, launch.partition,
+            launch.top_k, launch.normalize || scored.enabled, launch.live_rows, nullptr, launch.partition,
             launch.selected, launch.selected_bytes);
-        return finishLaunch("cudaMoE_owned_topk");
+        if (!finishLaunch("cudaMoE_owned_topk")) return false;
+        if (scored.enabled && scored.route_scale != 1.0f && rows > 0)
+        {
+            const int slots = rows * launch.top_k;
+            scale_owned_route_weights_kernel<<<(slots + kThreads - 1) / kThreads, kThreads, 0, native_stream>>>(
+                launch.selected, launch.capacity, launch.top_k, scored.route_scale, launch.live_rows, launch.partition);
+            if (!finishLaunch("cudaMoE_owned_route_scale")) return false;
+        }
+        return true;
     }
 
     bool publishRouterOwnedRows(const MoERouterRowPublication &publication, void *stream)

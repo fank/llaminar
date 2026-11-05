@@ -19,6 +19,8 @@
 
 #include "execution/moe/MoEOverlayHostServiceContract.h"
 #include "Qwen35MoEGraph.h"
+#include "../deepseek4/DeepSeekV4Config.h"
+#include "../deepseek4/DeepSeekV4ImagePreprocess.h"
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
 #include "execution/moe/MoEGraphOwnerProjection.h"
 #include "execution/moe/MoECPUExpertWorkspaceSource.h"
@@ -7251,8 +7253,8 @@ namespace llaminar2
         // =====================================================================
         // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
         // =====================================================================
-        std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> residual_read;
-        if (config_.flash_next)
+        std::optional<ResidualBlockRead> residual_read;
+        if (config_.usesResidualTrunk())
         {
             residual_read.emplace(addBranchBlockRead(graph, prefix, buffers,
                 layer_idx, total_tokens, device, ResidualBlock::FeedForward, predictor));
@@ -7366,6 +7368,44 @@ namespace llaminar2
                 device.is_gpu() && batch_size == 1
                     ? sequence_lengths_device
                     : nullptr;
+            if (config_.deepseek_v4)
+            {
+                // DeepSeek-V4 sqrt(softplus) routing: bias-shifted top-k on
+                // score layers, token-id hash rows on the first hash layers.
+                const auto &dsv4 = *config_.deepseek_v4;
+                route_params.scoring_function = MoERouterScoringPolicy::Function::SqrtSoftplus;
+                route_params.scoring_route_scale = dsv4.routeScale();
+                const auto execution_token_ids = [&] {
+                    const auto &input = modelForwardInput();
+                    return device.is_gpu() ? static_cast<const int32_t *>(input.token_ids_device)
+                                           : reinterpret_cast<const int32_t *>(input.token_ids);
+                };
+                if (dsv4.visionCapable())
+                {
+                    // Image sentinels select with exp_probs_b_vl on every
+                    // layer (hash layers included); the sentinel ids are
+                    // inside the chunk's ordinary token row.
+                    route_params.scoring_image_bias = layer.deepseek_v4.router_bias_vl;
+                    route_params.scoring_image_sentinel_base = deepseek4::kImageSentinelBase;
+                    route_params.scoring_image_sentinel_count = deepseek4::kImageSentinelCount;
+                    route_params.scoring_token_ids = execution_token_ids();
+                    if (!route_params.scoring_image_bias || !route_params.scoring_token_ids)
+                        throw std::invalid_argument("DeepSeek-V4 vision routing requires exp_probs_b_vl and token ids");
+                }
+                if (dsv4.layer(layer_idx).hashRouted)
+                {
+                    route_params.scoring_hash_table = layer.deepseek_v4.hash_table;
+                    route_params.scoring_token_ids = execution_token_ids();
+                    if (!route_params.scoring_hash_table || !route_params.scoring_token_ids)
+                        throw std::invalid_argument("DeepSeek-V4 hash routing requires its table and execution-device token ids");
+                }
+                else
+                {
+                    route_params.scoring_selection_bias = layer.deepseek_v4.router_bias;
+                    if (!route_params.scoring_selection_bias)
+                        throw std::invalid_argument("DeepSeek-V4 score routing requires exp_probs_b.bias");
+                }
+            }
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
             route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
@@ -7681,6 +7721,9 @@ namespace llaminar2
                 expert_params.down_exps = layer.moe_down_exps;
                 expert_params.expert_intermediate = expert_intermediate;
                 expert_params.layer_idx = layer_idx;
+                // DeepSeek-V4 clamps routed-expert SwiGLU operands per layer.
+                expert_params.swiglu_limit = config_.deepseek_v4
+                    ? config_.deepseek_v4->layer(layer_idx).swigluLimit : 0.0f;
                 expert_params.routing_indices = routing_indices;
                 expert_params.routing_weights = routing_weights;
                 expert_params.routing_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
@@ -10320,6 +10363,8 @@ namespace llaminar2
                     local_params.d_model = config_.d_model;
                     local_params.expert_intermediate = expert_intermediate;
                     local_params.layer_idx = layer_idx;
+                    local_params.swiglu_limit = config_.deepseek_v4
+                        ? config_.deepseek_v4->layer(layer_idx).swigluLimit : 0.0f;
                     local_params.expert_mask = std::move(participant_mask);
                     local_params.prepared_store = prepared_weight_store_;
                     local_params.physical_memory_authority = prepared_weight_store_
@@ -11365,6 +11410,8 @@ namespace llaminar2
                             local_params.d_model = config_.d_model;
                             local_params.expert_intermediate = expert_intermediate;
                             local_params.layer_idx = layer_idx;
+                            local_params.swiglu_limit = config_.deepseek_v4
+                                ? config_.deepseek_v4->layer(layer_idx).swigluLimit : 0.0f;
                             local_params.expert_mask = std::move(participant_mask);
                             local_params.prepared_store = prepared_weight_store_;
                             local_params.physical_memory_authority = prepared_weight_store_
@@ -13783,6 +13830,8 @@ namespace llaminar2
 
             SharedExpertFFNStage::Params shared_params;
             shared_params.device_id = shared_device;
+            shared_params.swiglu_limit = config_.deepseek_v4
+                ? config_.deepseek_v4->layer(layer_idx).sharedSwigluLimit : 0.0f;
             shared_params.input = buffers.normalized;
             shared_params.gate_w = layer.shared_expert_gate;
             shared_params.up_w = layer.shared_expert_up;

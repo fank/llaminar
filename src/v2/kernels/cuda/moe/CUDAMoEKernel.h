@@ -50,6 +50,13 @@ namespace llaminar2
     class CUDAMoEKernel final : public IMoEKernel, public CUDAKernelBase
     {
     public:
+        /** @copydoc IMoEKernel::setRouterScoringPolicy */
+        void setRouterScoringPolicy(const MoERouterScoringPolicy &policy) override { router_scoring_ = policy; }
+        /** @copydoc IMoEKernel::setSwiGLULimit */
+        void setSwiGLULimit(float limit) override { swiglu_limit_ = limit; }
+        /** @copydoc IMoEKernel::clampSwiGLUOperands */
+        bool clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit) override;
+
         /// @brief Construct a CUDA MoE kernel bound to one CUDA ordinal.
         explicit CUDAMoEKernel(int device_ordinal);
 
@@ -1039,6 +1046,8 @@ namespace llaminar2
         void unbindWorkspace() override { bindWorkspace(nullptr); }
 
     private:
+        MoERouterScoringPolicy router_scoring_; ///< Installed router scoring (Softmax by default).
+        float swiglu_limit_ = 0.0f; ///< SwiGLU clamp (0 = unclamped).
         /**
          * @brief Shared fused decode implementation after route metadata is resolved.
          *

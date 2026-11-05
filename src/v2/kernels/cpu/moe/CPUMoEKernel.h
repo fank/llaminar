@@ -42,6 +42,13 @@ namespace llaminar2
         CPUMoEKernel() = default;
         ~CPUMoEKernel() override = default;
 
+        /** @copydoc IMoEKernel::setRouterScoringPolicy */
+        void setRouterScoringPolicy(const MoERouterScoringPolicy &policy) override { router_scoring_ = policy; }
+        /** @copydoc IMoEKernel::setSwiGLULimit */
+        void setSwiGLULimit(float limit) override { swiglu_limit_ = limit; }
+        /** @copydoc IMoEKernel::clampSwiGLUOperands */
+        bool clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit) override;
+
         // =================================================================
         // IMoEKernel interface
         // =================================================================
@@ -291,6 +298,8 @@ namespace llaminar2
         }
 
     private:
+        MoERouterScoringPolicy router_scoring_; ///< Installed router scoring (Softmax by default).
+        float swiglu_limit_ = 0.0f; ///< SwiGLU clamp (0 = unclamped).
         /**
          * @brief Route prepared FP32, FP16 or BF16 gates without a weight cache.
          * @param hidden Original FP32 rows retained as the expert-Q8 publication source.

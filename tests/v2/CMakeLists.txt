@@ -853,6 +853,42 @@ add_executable(v2_test_qwen4exp_metadata
     unit/loaders/Test__GGUFIntegerArrays.cpp
 )
 target_link_libraries(v2_test_qwen4exp_metadata PRIVATE llaminar2_core GTest::gtest_main)
+add_executable(v2_test_deepseek4_cpu_kernels
+    unit/kernels/deepseek4/Test__DeepSeekV4CPUKernels.cpp)
+target_link_libraries(v2_test_deepseek4_cpu_kernels PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_DeepSeekV4CPUKernels
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_cpu_kernels>
+    LABELS "V2;Unit;Kernels;DeepSeekV4;CPU"
+    MPI_PROCS 1
+    NO_MODELS
+    NO_MPI
+)
+# Device-free DeepSeek-V4 compact-KV invariants: official QAT hand values,
+# 584/68-byte record round trips, chunk-straddling compressor/window state,
+# bounded indexer scratch and the single admission inventory.
+add_v2_test(V2_Integration_DeepSeekV4CompactKVContracts
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_cpu_kernels>
+        --gtest_filter=DeepSeekV4QAT.*:DeepSeekV4BufferLayout.*:DeepSeekV4CPUKernels.Compressor*:DeepSeekV4CPUKernels.Indexer*:DeepSeekV4CPUKernels.SparseAttention*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;DeepSeekV4;KVCache;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    NO_MPI
+)
+if(HAVE_CUDA)
+    # CUDA replay of the compact-KV kernels against the CPU bundle (byte-exact
+    # QAT/packing incl. subnormals under fast-math FTZ, bit-identical indexer
+    # scores, bounded-scratch selection) and the captured production stages
+    # (padded/zero live rows, frontier exactly once, reset/replay).
+    add_executable(v2_test_deepseek4_cuda_kernels
+        integration/kernels/deepseek4/Test__DeepSeekV4CUDAKernels.cpp
+        integration/kernels/deepseek4/Test__DeepSeekV4CapturedStages.cpp)
+    target_link_libraries(v2_test_deepseek4_cuda_kernels PRIVATE llaminar2_core GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Integration_CUDA_DeepSeekV4CompactKV
+        COMMAND $<TARGET_FILE:v2_test_deepseek4_cuda_kernels>
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;DeepSeekV4;KVCache;ByteExact;Regression"
+        ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+endif()
 # OCP MXFP4 (GGUF type 39): exact decode, NativeVNNI packing and CPU projection.
 add_executable(v2_test_mxfp4_tensor unit/tensors/Test__MXFP4Tensor.cpp)
 target_link_libraries(v2_test_mxfp4_tensor PRIVATE llaminar2_core GTest::gtest_main)
@@ -8044,6 +8080,99 @@ add_v2_test(V2_Integration_QwenNativeToolCallProtocol
     MPI_PROCS 1
     NO_MODELS
 )
+
+# DeepSeek-V4 chat protocol: production-vLLM golden prompts, request mapping and
+# DSML tool-call parsing. The golden JSON is embedded so installed runners need
+# no source tree.
+set(DSV4_CHAT_GOLDEN_HEADER "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures/DeepSeekV4ChatGolden.generated.h")
+add_custom_command(OUTPUT "${DSV4_CHAT_GOLDEN_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DJINJA_INPUT=${CMAKE_CURRENT_SOURCE_DIR}/unit/utils/fixtures/deepseek_v4_chat_encoding_golden.json
+        -DHEADER_OUTPUT=${DSV4_CHAT_GOLDEN_HEADER}
+        -DNAMESPACE=llaminar2::test::dsv4
+        -DSYMBOL=kChatEncodingGolden
+        -DSOURCE_URL=scripts/deepseek4/make_chat_encoding_golden.py
+        -DLICENSE=AGPL-3.0
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    DEPENDS unit/utils/fixtures/deepseek_v4_chat_encoding_golden.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    VERBATIM)
+add_executable(v2_test_deepseek4_chat_encoding unit/utils/Test__DeepSeekV4ChatEncoding.cpp "${DSV4_CHAT_GOLDEN_HEADER}")
+target_include_directories(v2_test_deepseek4_chat_encoding PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures"
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_link_libraries(v2_test_deepseek4_chat_encoding llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeepSeekV4ChatEncoding
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_chat_encoding>
+    LABELS "V2;Unit;DeepSeekV4;ChatTemplate;ToolCalling;TextProcessing"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+# Production defects fixed with this protocol: tool schemas lost the client's
+# key order, text-part content arrays returned HTTP 500, and DeepSeek-V4 was
+# parsed with the Qwen XML grammar.
+add_v2_test(V2_Integration_DeepSeekV4ChatProtocol
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_chat_encoding>
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;DeepSeekV4;ChatTemplate;ToolCalling;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_DeepSeekV4ToolSectionInsideReasoning
+    COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
+        --gtest_filter=Test__ChatCompletionHandler.DeepSeekV4ToolSectionInsideReasoningIsExecutable
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;DeepSeekV4;Reasoning;ToolCalling;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+# DeepSeek-V4 image admission equals Pillow (golden JSON embedded for installed runners).
+set(DSV4_IMAGE_GOLDEN_HEADER "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures/DeepSeekV4ImageGolden.generated.h")
+add_custom_command(OUTPUT "${DSV4_IMAGE_GOLDEN_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DJINJA_INPUT=${CMAKE_CURRENT_SOURCE_DIR}/unit/models/deepseek4/fixtures/deepseek_v4_image_preprocess_golden.json
+        -DHEADER_OUTPUT=${DSV4_IMAGE_GOLDEN_HEADER}
+        -DNAMESPACE=llaminar2::test::dsv4
+        -DSYMBOL=kImagePreprocessGolden
+        -DSOURCE_URL=scripts/deepseek4/make_image_preprocess_golden.py
+        -DLICENSE=AGPL-3.0
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    DEPENDS unit/models/deepseek4/fixtures/deepseek_v4_image_preprocess_golden.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    VERBATIM)
+add_executable(v2_test_deepseek4_image_preprocess unit/models/deepseek4/Test__DeepSeekV4ImagePreprocess.cpp "${DSV4_IMAGE_GOLDEN_HEADER}")
+target_include_directories(v2_test_deepseek4_image_preprocess PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures"
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_link_libraries(v2_test_deepseek4_image_preprocess llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeepSeekV4ImagePreprocess
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_image_preprocess>
+    LABELS "V2;Unit;DeepSeekV4;Vision;Multimodal"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
+set(DSV4_VISION_GOLDEN_HEADER "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures/DeepSeekV4VisionEncoderGolden.generated.h")
+add_custom_command(OUTPUT "${DSV4_VISION_GOLDEN_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DJINJA_INPUT=${CMAKE_CURRENT_SOURCE_DIR}/unit/models/deepseek4/fixtures/deepseek_v4_vision_encoder_golden.json
+        -DHEADER_OUTPUT=${DSV4_VISION_GOLDEN_HEADER}
+        -DNAMESPACE=llaminar2::test::dsv4
+        -DSYMBOL=kVisionEncoderGolden
+        -DSOURCE_URL=scripts/deepseek4/make_vision_encoder_golden.py
+        -DLICENSE=AGPL-3.0
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    DEPENDS unit/models/deepseek4/fixtures/deepseek_v4_vision_encoder_golden.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    VERBATIM)
+add_executable(v2_test_deepseek4_vision_encoder unit/models/deepseek4/Test__DeepSeekV4VisionEncoder.cpp "${DSV4_VISION_GOLDEN_HEADER}")
+target_include_directories(v2_test_deepseek4_vision_encoder PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures"
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_link_libraries(v2_test_deepseek4_vision_encoder llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeepSeekV4VisionEncoder
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_vision_encoder>
+    LABELS "V2;Unit;DeepSeekV4;Vision;Multimodal"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+# --mmproj failed to load because the 4D patch embedding was reordered like a
+# 2D GGUF tensor; the file-loaded tower must equal the in-memory one.
+add_v2_test(V2_Integration_DeepSeekV4MmprojLoad
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_vision_encoder>
+            --gtest_filter=DeepSeekV4VisionEncoder.MmprojFileLoadsTheSameTower
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;DeepSeekV4;Vision;Loaders;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
 # Note: ArgParser tests removed - replaced by OrchestrationConfigParser tests
 
@@ -18287,6 +18416,15 @@ add_v2_test(V2_Integration_CPUNativeWeightWindowContract
     MPI_PROCS 1
     NO_MODELS
 )
+# DeepSeek-V4 startup failed when the bounded CPU loader met the GGUF I32
+# token-id hash table; integer tables are verbatim resident roots only.
+add_v2_test(V2_Integration_CPUIntegerTableSource
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_weight_packing>
+            --gtest_filter=NativeWindowWriterContract.IntegerTablesAreVerbatimResidentOnly
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;DeepSeekV4;Loaders;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 add_v2_test(V2_Integration_CPUNativeResidentRankContract
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_weight_packing>
             --gtest_filter=NativeWindowWriterContract.ResidentParentsPreserveOriginalRankIncludingSingletonOuterAxes:NativeWindowWriterContract.NativeResidentParentsPreserveRankWithoutInventingQ8_1Parents
@@ -24656,6 +24794,16 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 MPI_PROCS 1
                 NO_MODELS
                 TIMEOUT 120)
+            if(_live_rows_backend STREQUAL "CUDA")
+                # DeepSeek-V4 sqrt(softplus) owned-row routing == complete-row routing.
+                add_v2_test(V2_Integration_MoERouterOwnedRowsScored_CUDA
+                    COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                        --gtest_filter=MoERouterOwnedRows.CUDAScored
+                    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;DeepSeekV4;GraphCapture;ByteExact;Regression"
+                    MPI_PROCS 1
+                    NO_MODELS
+                    TIMEOUT 120)
+            endif()
             add_v2_test(V2_Integration_FP32SubnormalContract_${_live_rows_backend}
                 COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
                     --gtest_filter=DeviceFP32SubnormalContract.${_live_rows_backend}
@@ -26451,6 +26599,7 @@ add_v2_test(V2_Unit_KVCacheMemoryEstimator
 # Test: ActivationMemoryEstimator — activation buffer peak estimation
 add_executable(v2_test_activation_memory_estimator
     unit/planning/Test__ActivationMemoryEstimator.cpp
+    unit/planning/Test__DeepSeekV4Admission.cpp
     unit/planning/Test__CPUGraphArenaDeclarations.cpp
     unit/planning/Test__MoEProjectionArenaGeometry.cpp)
 target_link_libraries(v2_test_activation_memory_estimator llaminar2_core GTest::gtest GTest::gtest_main)
@@ -26463,6 +26612,15 @@ add_v2_test(V2_Integration_MTPShardedTerminalGatherAccounting
     COMMAND $<TARGET_FILE:v2_test_activation_memory_estimator>
         --gtest_filter=Test__ActivationMemoryEstimator.Qwen35MoE122BLocalTP_MatchesDeclarativeArenaByteForByte
     LABELS "V2;Integration;ProductionTestPreflight;MTP;LocalTP;Memory;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+# DeepSeek-V4 model-owned attention state: GPU arena prices every registered
+# root once, the cache charges no KV payload, no conversion scratch exists.
+add_v2_test(V2_Integration_DeepSeekV4ArenaAdmission
+    COMMAND $<TARGET_FILE:v2_test_activation_memory_estimator>
+        --gtest_filter=DeepSeekV4Admission.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;DeepSeekV4;Memory;PhysicalMemoryAuthority;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -29245,6 +29403,13 @@ if(HAVE_CUDA)
         ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_HCUpWorkspaceAdmission)
+endif()
+# DeepSeek-V4 compact persistent KV (registered beside V2_Unit_DeepSeekV4CPUKernels).
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_DeepSeekV4CompactKVContracts
+    V2_Integration_DeepSeekV4ArenaAdmission)
+if(HAVE_CUDA)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_DeepSeekV4CompactKV)
 endif()
 
 # Wider residuals cross PP and shifted-prefill boundaries as complete live rows.

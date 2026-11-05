@@ -1257,6 +1257,16 @@ extern "C"
         const int *device_effective_seq_len,
         void *deferred_selected_route_ledger = nullptr);
 
+    bool cudaMoE_scored_router_logit_transform(
+        float *logits, int seq_len, int num_experts, int top_k,
+        const float *bias, const int32_t *hash_table, int hash_vocab, const int32_t *token_ids,
+        const int *effective_seq_len, int device_idx, void *stream,
+        const float *image_bias, int32_t image_base, int32_t image_count);
+    bool cudaMoE_scale_route_weights(float *weights, int seq_len, int top_k, float scale,
+                                     const int *effective_seq_len, int device_idx, void *stream);
+    bool cudaMoE_scale_runtime_route_weights(void *runtime_layer, float *legacy_weights, int top_k, float scale,
+                                             int device_idx, void *stream);
+
     bool cudaMoE_softmax_topk_decode_runtime(
         float *logits, void *runtime_layer,
         float *legacy_indices, float *legacy_weights,
@@ -1582,7 +1592,10 @@ extern "C"
         int seq_len, int d_model, const int *device_effective_seq_len,
         int device_idx, void *stream);
 
-    bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream);
+    bool cudaMoE_swiglu_clamp_operands(float *gate, float *up, int count, float swiglu_limit,
+                                       int device_idx, void *stream);
+    bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream,
+        float swiglu_limit);
     bool cudaMoE_weighted_add(float *output, const float *input, float weight, int count, int device_idx, void *stream);
 
     bool cudaMoE_count_per_expert(
@@ -1906,7 +1919,8 @@ extern "C"
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
-        void *stream);
+        void *stream,
+        float swiglu_limit);
 
     bool cudaMoE_grouped_swiglu_down_floating_decode_table(
         const float *const *d_gate_ptrs,
@@ -1922,7 +1936,8 @@ extern "C"
         int num_experts,
         llaminar2::DeviceMoEWeightFormat format,
         int device_idx,
-        void *stream);
+        void *stream,
+        float swiglu_limit);
 
     bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
         const float *const *d_gate_ptrs,
@@ -1941,7 +1956,8 @@ extern "C"
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
-        void *stream);
+        void *stream,
+        float swiglu_limit);
 
     bool cudaMoE_grouped_prefill_pipeline(
         const float *d_hidden,
@@ -1995,7 +2011,8 @@ extern "C"
             imma_gateup_schedule,
         int device_idx,
         void *stream,
-        const llaminar2::MoEPrefillProjectionExecution &execution);
+        const llaminar2::MoEPrefillProjectionExecution &execution,
+        float swiglu_limit);
 
 
     bool cudaMoE_reduce_canonical_route_contributions(
@@ -4730,6 +4747,13 @@ namespace llaminar2
         // cache and hidden bank; capture only consumes their retained addresses.
         const bool q8_prefill = gate_is_fp32 &&
             debugEnv().gemm.cuda_moe_router_prefill == CUDARouterPrefillArithmetic::Q8;
+        // The opt-in Q8 prefill router has no scored selection stage; the
+        // ordinary and owned-row FP routers both apply it.
+        if (!router_scoring_.isSoftmax() && q8_prefill)
+        {
+            LOG_ERROR("[CUDAMoEKernel] scored (sqrt-softplus) routing does not implement the Q8 prefill router");
+            return false;
+        }
         invalidateRouterQ8HiddenPublication();
         if (!prepareRequiredRouterQ8Hidden(seq_len, d_model, top_k))
             return false;
@@ -4795,7 +4819,13 @@ namespace llaminar2
                 .format = gate_is_fp32 ? MoERouterPreparedFormat::FP32 :
                     (gate_type == TensorType::FP16 ? MoERouterPreparedFormat::FP16 : MoERouterPreparedFormat::BF16),
                 .gate = gate_weights, .logits = d_route_logits_,
-                .selected = owned->selected, .selected_bytes = owned->selected_bytes};
+                .selected = owned->selected, .selected_bytes = owned->selected_bytes,
+                .scored = {.enabled = !router_scoring_.isSoftmax(), .bias = router_scoring_.selection_bias,
+                           .hash_table = router_scoring_.hash_table, .hash_vocab = router_scoring_.hash_vocab,
+                           .token_ids = router_scoring_.token_ids, .route_scale = router_scoring_.route_scale,
+                           .image_bias = router_scoring_.image_bias,
+                           .image_sentinel_base = router_scoring_.image_sentinel_base,
+                           .image_sentinel_count = router_scoring_.image_sentinel_count}};
             const bool submitted = cuda::routeOwnedRows(launch, stream, router_q8_prefill_hardware_);
             if (submitted && gate_type == TensorType::FP16)
                 PerfStatsCollector::addCounter("cuda_moe", "router_fp16_owned_operands", 1.0, {}, {},
@@ -4826,10 +4856,21 @@ namespace llaminar2
                  {"d_model", std::to_string(d_model)},
                  {"num_experts", std::to_string(num_experts)}});
         }
+        const bool scored = !router_scoring_.isSoftmax();
+        if (scored &&
+            !cudaMoE_scored_router_logit_transform(d_route_logits_, seq_len, num_experts, top_k,
+                router_scoring_.selection_bias, router_scoring_.hash_table, router_scoring_.hash_vocab,
+                router_scoring_.token_ids, device_effective_seq_len, device_ordinal_, getStream(),
+                router_scoring_.image_bias, router_scoring_.image_sentinel_base, router_scoring_.image_sentinel_count))
+            return false;
         if (!cudaMoE_softmax_topk(d_route_logits_, output_indices, output_weights,
-                                  seq_len, num_experts, top_k, normalize_weights,
+                                  seq_len, num_experts, top_k, normalize_weights || scored,
                                   device_ordinal_, getStream(),
                                   device_effective_seq_len))
+            return false;
+        if (scored && router_scoring_.route_scale != 1.0f &&
+            !cudaMoE_scale_route_weights(output_weights, seq_len, top_k, router_scoring_.route_scale,
+                                         device_effective_seq_len, device_ordinal_, getStream()))
             return false;
         return true;
     }
@@ -4866,7 +4907,7 @@ namespace llaminar2
     {
         if (count <= 0)
             return;
-        cudaMoE_swiglu(gate, up, count, device_ordinal_, getStream());
+        cudaMoE_swiglu(gate, up, count, device_ordinal_, getStream(), swiglu_limit_);
     }
 
     void CUDAMoEKernel::weightedAdd(float *output, const float *input, float weight, int count)
@@ -5449,6 +5490,22 @@ namespace llaminar2
             if (!route_ok)
                 return false;
         }
+        const bool scored = !router_scoring_.isSoftmax();
+        if (scored)
+        {
+            if (q8_router_requested)
+            {
+                LOG_ERROR("[CUDAMoEKernel::decodeRouteSelect] scored routing does not support the Q8 router");
+                return false;
+            }
+            if (!cudaMoE_scored_router_logit_transform(d_route_logits_, 1, num_experts, top_k,
+                    router_scoring_.selection_bias, router_scoring_.hash_table, router_scoring_.hash_vocab,
+                    router_scoring_.token_ids, nullptr, device_ordinal_, stream,
+                    router_scoring_.image_bias, router_scoring_.image_sentinel_base,
+                    router_scoring_.image_sentinel_count))
+                return false;
+            normalize_weights = true;
+        }
         const bool unique_owner_route =
             prepared_decode_resident_set_policy_ ==
             RoutedExpertResidentSetPolicy::UniqueOwner;
@@ -5492,6 +5549,10 @@ namespace llaminar2
                                            device_ordinal_,
                                            stream);
         if (!route_ready)
+            return false;
+        if (scored && router_scoring_.route_scale != 1.0f &&
+            !cudaMoE_scale_runtime_route_weights(runtime_layer, legacy_weights, top_k,
+                                                 router_scoring_.route_scale, device_ordinal_, stream))
             return false;
 
         if (write_legacy_outputs)
@@ -6746,6 +6807,27 @@ namespace llaminar2
         swiGLU(static_cast<float *>(gate->gpu_data_ptr()),
                static_cast<const float *>(up->gpu_data_ptr()), count);
         markDeviceWritten(gate, device, stream);
+    }
+
+    bool CUDAMoEKernel::clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit)
+    {
+        if (limit <= 0.0f)
+            return true;
+        if (count <= 0 || !gate || !up || gate->numel() < static_cast<size_t>(count) ||
+            up->numel() < static_cast<size_t>(count))
+            return false;
+        void *stream = requireStream("CUDAMoEKernel::clampSwiGLUOperands");
+        const DeviceId device = deviceId();
+        if (!requireTensorOnDevice(gate, device, stream, "gate") ||
+            !requireTensorOnDevice(up, device, stream, "up"))
+            return false;
+        if (!cudaMoE_swiglu_clamp_operands(static_cast<float *>(gate->gpu_data_ptr()),
+                                           static_cast<float *>(up->gpu_data_ptr()),
+                                           count, limit, device_ordinal_, stream))
+            return false;
+        markDeviceWritten(gate, device, stream);
+        markDeviceWritten(up, device, stream);
+        return true;
     }
 
     void CUDAMoEKernel::weightedAddFromTensors(ITensor *output, ITensor *input, float weight, int count)
@@ -9017,7 +9099,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                         num_experts,
                         gateup_table.weight_format,
                         device_ordinal_,
-                        producer_stream, execution);
+                        producer_stream, execution, swiglu_limit_);
                 },
                 [&](const EnqueuedWorkspaceRead<float> &read)
                 {
@@ -9285,7 +9367,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                     prefill_policy.imma_down_columns,
                     prefill_policy.imma_gateup_schedule,
                     device_ordinal_,
-                    producer_stream, execution);
+                    producer_stream, execution, swiglu_limit_);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -9512,7 +9594,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                         num_experts,
                         gateup_table.weight_format,
                         device_ordinal_,
-                        producer_stream, execution);
+                        producer_stream, execution, swiglu_limit_);
                 },
                 [&](const EnqueuedWorkspaceRead<float> &read)
                 {
@@ -9788,7 +9870,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                     prefill_policy.imma_down_columns,
                     prefill_policy.imma_gateup_schedule,
                     device_ordinal_,
-                    producer_stream, execution);
+                    producer_stream, execution, swiglu_limit_);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -10407,7 +10489,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   table.num_experts,
                   table.weight_format,
                   device_ordinal_,
-                  stream)
+                  stream, swiglu_limit_)
             : cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
                   d_gate_ptrs,
                   d_up_ptrs,
@@ -10426,7 +10508,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   table.codebook_id,
                   k_partitions,
                   device_ordinal_,
-                  stream);
+                  stream, swiglu_limit_);
         if (ok)
         {
             markDeviceWritten(output, device, stream);
@@ -10788,7 +10870,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             table.codebook_id,
             k_partitions,
             device_ordinal_,
-            stream);
+            stream, swiglu_limit_);
         if (ok)
         {
             markDeviceWritten(output, device, stream);
@@ -11583,7 +11665,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   down_table.num_experts,
                   down_table.weight_format,
                   device_ordinal_,
-                  stream)
+                  stream, swiglu_limit_)
             : cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
                   d_down_gate_ptrs,
                   d_down_up_ptrs,
@@ -11602,7 +11684,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   down_table.codebook_id,
                   down_k_partitions,
                   device_ordinal_,
-                  stream);
+                  stream, swiglu_limit_);
         if (!down_ok)
             return false;
 
@@ -11887,7 +11969,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             table.codebook_id,
             k_partitions,
             device_ordinal_,
-            stream);
+            stream, swiglu_limit_);
 
         if (ok)
         {
